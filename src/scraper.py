@@ -71,6 +71,23 @@ def _extract_item(item: dict) -> dict | None:
     }
 
 
+def _find_key_recursive(d, target="search_id"):
+    """Busca una clave recursivamente en cualquier nivel del diccionario o lista."""
+    if isinstance(d, dict):
+        if target in d and d[target]:
+            return d[target]
+        for v in d.values():
+            res = _find_key_recursive(v, target)
+            if res:
+                return res
+    elif isinstance(d, list):
+        for item in d:
+            res = _find_key_recursive(item, target)
+            if res:
+                return res
+    return None
+
+
 def search_term(term: str) -> list[dict]:
     """Busca anuncios para un término usando la API moderna v3 en 2 pasos de Wallapop."""
     headers = {
@@ -91,6 +108,7 @@ def search_term(term: str) -> list[dict]:
     }
 
     loc_name = config.CONFIG.get("location", "").strip().lower()
+    lat = lon = None
     if loc_name in CITY_COORDINATES:
         lat, lon = CITY_COORDINATES[loc_name]
         params["latitude"] = lat
@@ -102,8 +120,8 @@ def search_term(term: str) -> list[dict]:
 
     # Paso 1: Obtener el search_id inicial
     init_urls = [
-        "https://api.wallapop.com/api/v3/search",
         "https://api.wallapop.com/api/v3/search/components",
+        "https://api.wallapop.com/api/v3/search",
     ]
 
     search_id = None
@@ -112,11 +130,16 @@ def search_term(term: str) -> list[dict]:
             r = session.get(init_url, headers=headers, params=params, timeout=10)
             if r.status_code == 200:
                 data = r.json()
-                search_id = data.get("search_id") or data.get("meta", {}).get("search_id")
+                search_id = _find_key_recursive(data, "search_id")
                 if search_id:
+                    print(f"[scraper] Obtenido search_id con éxito: {search_id}")
                     break
+                else:
+                    keys = list(data.keys()) if isinstance(data, dict) else type(data)
+                    print(f"[scraper] {init_url} respondió 200 pero no contenía search_id. Claves: {keys}")
             else:
-                print(f"[scraper] {init_url} -> {r.status_code}")
+                snippet = r.text[:100].replace("\n", " ") if r.text else ""
+                print(f"[scraper] {init_url} -> Código {r.status_code}: {snippet}")
         except Exception as e:
             print(f"[scraper] Error en {init_url}: {e}")
 
@@ -130,12 +153,21 @@ def search_term(term: str) -> list[dict]:
         "search_id": search_id,
         "start": 0,
     }
+    if lat and lon:
+        section_params["latitude"] = lat
+        section_params["longitude"] = lon
 
     try:
         r = session.get(section_url, headers=headers, params=section_params, timeout=10)
         if r.status_code == 200:
             data = r.json()
-            raw_items = data.get("section", {}).get("payload", {}).get("items", [])
+            # Buscar la lista de items
+            raw_items = (
+                data.get("section", {}).get("payload", {}).get("items", [])
+                or data.get("items", [])
+                or _find_key_recursive(data, "items")
+                or []
+            )
             items = []
             for raw in raw_items:
                 parsed = _extract_item(raw)
@@ -143,11 +175,13 @@ def search_term(term: str) -> list[dict]:
                     items.append(parsed)
             return items
         else:
-            print(f"[scraper] /api/v3/search/section -> Código {r.status_code}")
+            snippet = r.text[:100].replace("\n", " ") if r.text else ""
+            print(f"[scraper] /api/v3/search/section -> Código {r.status_code}: {snippet}")
             return []
     except Exception as e:
         print(f"[scraper] Error en /search/section: {e}")
         return []
+
 
 
 def fetch_items() -> list[dict]:
