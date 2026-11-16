@@ -1,7 +1,12 @@
 import time
-import requests
-from urllib.parse import urlencode
 from src import config
+
+try:
+    from curl_cffi import requests
+    HAS_CURL_CFFI = True
+except ImportError:
+    import requests
+    HAS_CURL_CFFI = False
 
 # Coordenadas de ciudades frecuentes para búsquedas por radio en Wallapop
 CITY_COORDINATES = {
@@ -18,7 +23,6 @@ CITY_COORDINATES = {
 
 def _extract_item(obj: dict) -> dict | None:
     """Extrae la información de un anuncio a partir de la respuesta de Wallapop."""
-    # En la API de Wallapop, los datos pueden venir en la raíz o dentro de 'content'
     item = obj.get("content", {})
     if isinstance(item, dict) and "item" in item:
         item = item["item"]
@@ -71,12 +75,18 @@ def search_term(term: str) -> list[dict]:
     headers = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
         "Accept": "application/json, text/plain, */*",
-        "Accept-Language": "es-ES,es;q=0.9",
+        "Accept-Language": "es-ES,es;q=0.9,en;q=0.8",
+        "Referer": "https://es.wallapop.com/",
+        "Origin": "https://es.wallapop.com",
         "X-DeviceOS": "0",
+        "Sec-Fetch-Dest": "empty",
+        "Sec-Fetch-Mode": "cors",
+        "Sec-Fetch-Site": "same-site",
     }
 
     params = {
         "keywords": term,
+        "source": "search_box",
         "min_sale_price": config.CONFIG["price_min"],
         "max_sale_price": config.CONFIG["price_max"],
         "order_by": "newest",
@@ -92,7 +102,11 @@ def search_term(term: str) -> list[dict]:
             params["distance_in_km"] = config.CONFIG["radius_km"]
 
     try:
-        resp = requests.get(url, headers=headers, params=params, timeout=12)
+        if HAS_CURL_CFFI:
+            resp = requests.get(url, headers=headers, params=params, timeout=12, impersonate="chrome")
+        else:
+            resp = requests.get(url, headers=headers, params=params, timeout=12)
+
         if resp.status_code == 200:
             data = resp.json()
             search_objects = data.get("search_objects", [])
@@ -129,7 +143,8 @@ def fetch_items() -> list[dict]:
                 seen_in_batch.add(item["id"])
                 all_items.append(item)
 
-        time.sleep(1)  # Pausa breve para evitar bloqueos por frecuencia
+        time.sleep(1.5)  # Pausa entre términos
 
     return all_items
+
 

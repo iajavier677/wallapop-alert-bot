@@ -1,8 +1,9 @@
 requests
 beautifulsoup4
-playwright
 sqlalchemy
 alembic
 python-telegram-bot
 APScheduler
 python-dotenv
+curl_cffi
+
