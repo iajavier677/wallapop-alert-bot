@@ -1,7 +1,5 @@
 import time
 import json
-import re
-from bs4 import BeautifulSoup
 from src import config
 
 try:
@@ -24,24 +22,21 @@ CITY_COORDINATES = {
 }
 
 
-def _extract_item(obj: dict) -> dict | None:
-    """Extrae la información de un anuncio a partir de un objeto JSON de Wallapop."""
-    if not isinstance(obj, dict):
-        return None
-
-    # En la API de Wallapop, los datos pueden venir directamente o dentro de 'content' / 'item'
-    item = obj.get("content", obj)
-    if isinstance(item, dict) and "item" in item:
-        item = item["item"]
+def _extract_item(item: dict) -> dict | None:
+    """Extrae la información de un anuncio a partir de un elemento de Wallapop v3."""
     if not isinstance(item, dict):
         return None
+
+    # Si viene anidado en 'item'
+    if "item" in item and isinstance(item["item"], dict):
+        item = item["item"]
 
     item_id = str(item.get("id", ""))
     title = item.get("title", "")
     if not title:
         return None
 
-    # Precio
+    # Precio (puede ser float, int o dict con {"amount": X, "currency": "EUR"})
     raw_price = item.get("price", 0)
     if isinstance(raw_price, dict):
         raw_price = raw_price.get("amount", 0)
@@ -76,8 +71,8 @@ def _extract_item(obj: dict) -> dict | None:
     }
 
 
-def _search_api(term: str) -> list[dict]:
-    """Intenta buscar vía la API interna de Wallapop (search/components)."""
+def search_term(term: str) -> list[dict]:
+    """Busca anuncios para un término usando la API moderna v3 en 2 pasos de Wallapop."""
     headers = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
         "Accept": "application/json, text/plain, */*",
@@ -85,14 +80,11 @@ def _search_api(term: str) -> list[dict]:
         "Origin": "https://es.wallapop.com",
         "Referer": "https://es.wallapop.com/",
         "X-DeviceOS": "0",
-        "Sec-Fetch-Dest": "empty",
-        "Sec-Fetch-Mode": "cors",
-        "Sec-Fetch-Site": "same-site",
     }
 
     params = {
-        "keywords": term,
         "source": "search_box",
+        "keywords": term,
         "min_sale_price": config.CONFIG["price_min"],
         "max_sale_price": config.CONFIG["price_max"],
         "order_by": "newest",
@@ -106,102 +98,56 @@ def _search_api(term: str) -> list[dict]:
         if config.CONFIG.get("radius_km"):
             params["distance_in_km"] = config.CONFIG["radius_km"]
 
-    # Probamos primero el endpoint moderno /api/v3/search/components
-    endpoints = [
+    session = requests.Session(impersonate="chrome") if HAS_CURL_CFFI else requests.Session()
+
+    # Paso 1: Obtener el search_id inicial
+    init_urls = [
+        "https://api.wallapop.com/api/v3/search",
         "https://api.wallapop.com/api/v3/search/components",
-        "https://api.wallapop.com/api/v3/general/search",
     ]
 
-    for url in endpoints:
+    search_id = None
+    for init_url in init_urls:
         try:
-            if HAS_CURL_CFFI:
-                resp = requests.get(url, headers=headers, params=params, timeout=10, impersonate="chrome")
+            r = session.get(init_url, headers=headers, params=params, timeout=10)
+            if r.status_code == 200:
+                data = r.json()
+                search_id = data.get("search_id") or data.get("meta", {}).get("search_id")
+                if search_id:
+                    break
             else:
-                resp = requests.get(url, headers=headers, params=params, timeout=10)
-
-            if resp.status_code == 200:
-                data = resp.json()
-                items = []
-                # Formato search_objects
-                search_objects = data.get("search_objects", [])
-                for obj in search_objects:
-                    parsed = _extract_item(obj)
-                    if parsed:
-                        items.append(parsed)
-                # Formato sections (components)
-                sections = data.get("sections", [])
-                for sec in sections:
-                    for obj in sec.get("items", []) or sec.get("elements", []):
-                        parsed = _extract_item(obj)
-                        if parsed:
-                            items.append(parsed)
-                if items:
-                    return items
-            else:
-                snippet = resp.text[:120].replace("\n", " ") if resp.text else ""
-                print(f"[scraper-api] {url} -> Código {resp.status_code}: {snippet}")
+                print(f"[scraper] {init_url} -> {r.status_code}")
         except Exception as e:
-            print(f"[scraper-api] Error en {url}: {e}")
+            print(f"[scraper] Error en {init_url}: {e}")
 
-    return []
+    if not search_id:
+        print(f"[scraper] No se obtuvo search_id para '{term}'")
+        return []
 
-
-def _search_web(term: str) -> list[dict]:
-    """Fallback: descarga el HTML de búsqueda de Wallapop y extrae el JSON __NEXT_DATA__."""
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
-        "Accept-Language": "es-ES,es;q=0.9,en;q=0.8",
-        "Referer": "https://es.wallapop.com/",
+    # Paso 2: Obtener los anuncios usando el search_id
+    section_url = "https://api.wallapop.com/api/v3/search/section"
+    section_params = {
+        "search_id": search_id,
+        "start": 0,
     }
 
-    params = {
-        "keywords": term,
-        "min_sale_price": config.CONFIG["price_min"],
-        "max_sale_price": config.CONFIG["price_max"],
-    }
-
-    url = "https://es.wallapop.com/search"
     try:
-        if HAS_CURL_CFFI:
-            resp = requests.get(url, headers=headers, params=params, timeout=12, impersonate="chrome")
-        else:
-            resp = requests.get(url, headers=headers, params=params, timeout=12)
-
-        if resp.status_code != 200:
-            snippet = resp.text[:120].replace("\n", " ") if resp.text else ""
-            print(f"[scraper-web] Código {resp.status_code}: {snippet}")
-            return []
-
-        # Buscar el script con ID __NEXT_DATA__
-        soup = BeautifulSoup(resp.text, "html.parser")
-        next_data = soup.find("script", id="__NEXT_DATA__")
-        if next_data and next_data.string:
-            json_data = json.loads(next_data.string)
-            page_props = json_data.get("props", {}).get("pageProps", {})
-            raw_items = page_props.get("items", []) or page_props.get("searchObjects", [])
+        r = session.get(section_url, headers=headers, params=section_params, timeout=10)
+        if r.status_code == 200:
+            data = r.json()
+            raw_items = data.get("section", {}).get("payload", {}).get("items", [])
             items = []
             for raw in raw_items:
                 parsed = _extract_item(raw)
                 if parsed:
                     items.append(parsed)
             return items
+        else:
+            print(f"[scraper] /api/v3/search/section -> Código {r.status_code}")
+            return []
     except Exception as e:
-        print(f"[scraper-web] Error extrayendo HTML: {e}")
-
-    return []
-
-
-def search_term(term: str) -> list[dict]:
-    """Busca anuncios para un término usando la API o el scraper web como respaldo."""
-    # 1. Intentar API
-    items = _search_api(term)
-    if items:
-        return items
-
-    # 2. Si la API da 403, intentar extracción web de Next.js
-    items = _search_web(term)
-    return items
+        print(f"[scraper] Error en /search/section: {e}")
+        return []
 
 
 def fetch_items() -> list[dict]:
@@ -227,6 +173,7 @@ def fetch_items() -> list[dict]:
         time.sleep(1.5)
 
     return all_items
+
 
 
 
