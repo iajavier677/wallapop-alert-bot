@@ -23,26 +23,31 @@ CITY_COORDINATES = {
 }
 
 
-def _extract_item(item: dict) -> dict | None:
-    """Extrae la información de un anuncio a partir de un elemento de Wallapop v3."""
+def _extract_item(data: dict) -> dict | None:
+    """Extrae la información de un anuncio a partir de un objeto JSON de Wallapop v3."""
+    if not isinstance(data, dict):
+        return None
+
+    # Filtrar banners o publicidades
+    if data.get("type") in ("ads_banner", "banner", "ad"):
+        return None
+
+    # Filtrar reservados o vendidos
+    if data.get("reserved") or data.get("flags", {}).get("reserved"):
+        return None
+
+    item = data.get("item", data)
     if not isinstance(item, dict):
         return None
 
-    # Ignorar anuncios ya reservados o vendidos
-    if item.get("reserved") or item.get("flags", {}).get("reserved"):
+    # Debe tener id y título
+    item_id = str(item.get("id") or data.get("id") or "")
+    title = item.get("title") or data.get("title") or ""
+    if not item_id or not title or not isinstance(title, str) or len(title.strip()) < 2:
         return None
 
-    # Si viene anidado en 'item'
-    if "item" in item and isinstance(item["item"], dict):
-        item = item["item"]
-
-    item_id = str(item.get("id", ""))
-    title = item.get("title", "")
-    if not title:
-        return None
-
-    # Precio (soporta int, float, price.amount y price.cash.amount)
-    raw_price = item.get("price", 0)
+    # Precio
+    raw_price = item.get("price") or data.get("price") or 0
     if isinstance(raw_price, dict):
         raw_price = raw_price.get("amount") or raw_price.get("cash", {}).get("amount", 0)
     try:
@@ -50,30 +55,59 @@ def _extract_item(item: dict) -> dict | None:
     except (ValueError, TypeError):
         price = 0
 
+    if price <= 0:
+        return None
+
     # Ubicación
-    loc = item.get("location", {})
+    loc = item.get("location") or data.get("location") or {}
     city = loc.get("city", "") if isinstance(loc, dict) else str(loc or "")
 
     # Estado
-    condition = item.get("condition", "") or item.get("status", "")
+    condition = item.get("condition") or data.get("condition") or item.get("status") or ""
 
     # URL
-    web_slug = item.get("web_slug", "")
+    web_slug = item.get("web_slug") or data.get("web_slug") or ""
     if web_slug:
         url = f"https://es.wallapop.com/item/{web_slug}"
-    elif item_id:
-        url = f"https://es.wallapop.com/item/{item_id}"
     else:
-        url = "https://es.wallapop.com"
+        url = f"https://es.wallapop.com/item/{item_id}"
 
     return {
         "id": item_id,
-        "title": title,
+        "title": title.strip(),
         "price": price,
         "condition": condition,
         "location": city,
         "url": url,
     }
+
+
+def _collect_items_recursive(data, collected=None, seen_ids=None) -> list[dict]:
+    """Rastrea exhaustivamente cualquier JSON y extrae todos los anuncios válidos."""
+    if collected is None:
+        collected = []
+    if seen_ids is None:
+        seen_ids = set()
+
+    if isinstance(data, dict):
+        item = _extract_item(data)
+        if item and item["id"]:
+            if item["id"] not in seen_ids:
+                seen_ids.add(item["id"])
+                collected.append(item)
+            return collected
+
+        for v in data.values():
+            if isinstance(v, (dict, list)):
+                _collect_items_recursive(v, collected, seen_ids)
+
+    elif isinstance(data, list):
+        for elem in data:
+            if isinstance(elem, (dict, list)):
+                _collect_items_recursive(elem, collected, seen_ids)
+
+    return collected
+
 
 
 
@@ -118,16 +152,14 @@ def _search_web(term: str) -> list[dict]:
             next_data = soup.find("script", id="__NEXT_DATA__")
             if next_data and next_data.string:
                 json_data = json.loads(next_data.string)
-                raw_items = (
-                    _find_key_recursive(json_data, "items")
-                    or _find_key_recursive(json_data, "searchObjects")
-                    or []
-                )
-                if isinstance(raw_items, list):
-                    items = [_extract_item(x) for x in raw_items if _extract_item(x)]
-                    if items:
-                        print(f"[scraper-web] {len(items)} anuncios obtenidos vía __NEXT_DATA__.")
-                        return items
+                items = _collect_items_recursive(json_data)
+                if items:
+                    print(f"[scraper-web] {len(items)} anuncios obtenidos vía __NEXT_DATA__.")
+                    return items
+                else:
+                    print("[scraper-web] __NEXT_DATA__ encontrado pero 0 items cumplieron formato.")
+            else:
+                print(f"[scraper-web] No se encontró etiqueta __NEXT_DATA__ (longitud HTML {len(resp.text)}).")
         else:
             snippet = resp.text[:100].replace("\n", " ") if resp.text else ""
             print(f"[scraper-web] Código {resp.status_code}: {snippet}")
@@ -176,33 +208,24 @@ def search_term(term: str) -> list[dict]:
         if r1.status_code == 200:
             data1 = r1.json()
 
-            # Diagnóstico de components
-            keys = list(data1.keys()) if isinstance(data1, dict) else type(data1)
-            print(f"[scraper] components respondió 200. Claves: {keys}")
-            print(f"[scraper] Muestra: {json.dumps(data1, ensure_ascii=False)[:250]}")
+            # 1. Comprobar si components ya traía items directamente
+            items = _collect_items_recursive(data1)
+            if items:
+                print(f"[scraper] {len(items)} anuncios obtenidos directamente en components.")
+                return items
 
-            # Comprobar si components ya traía items directamente
-            raw_items = (
-                _find_key_recursive(data1, "items")
-                or _find_key_recursive(data1, "elements")
-                or []
-            )
-            if raw_items and isinstance(raw_items, list) and len(raw_items) > 0:
-                items = [_extract_item(x) for x in raw_items if _extract_item(x)]
-                if items:
-                    print(f"[scraper] {len(items)} anuncios obtenidos directamente en components.")
-                    return items
-
-            # Extraer search_id y section_id para el paso 2
+            # 2. Extraer search_id y buscar la sección que NO sea ads_banner
             search_id = _find_key_recursive(data1, "search_id")
-            section_id = _find_key_recursive(data1, "section_id")
-            if not section_id:
-                sections = data1.get("sections") or data1.get("components") or []
-                if isinstance(sections, list):
-                    for s in sections:
-                        if isinstance(s, dict) and s.get("id"):
-                            section_id = s.get("id")
-                            break
+            components_list = data1.get("components") or []
+            types = [c.get("type") for c in components_list if isinstance(c, dict)]
+            print(f"[scraper] Componentes disponibles: {types}")
+
+            for c in components_list:
+                if isinstance(c, dict) and c.get("type") not in ("ads_banner", "banner"):
+                    section_id = c.get("id") or c.get("section_id")
+                    if section_id:
+                        print(f"[scraper] Sección válida seleccionada: {c.get('type')} (id={section_id})")
+                        break
 
             print(f"[scraper] search_id={search_id}, section_id={section_id}")
         else:
@@ -222,12 +245,7 @@ def search_term(term: str) -> list[dict]:
             r2 = session.get(section_url, headers=headers, params=section_params, timeout=10)
             if r2.status_code == 200:
                 data2 = r2.json()
-                raw_items = (
-                    _find_key_recursive(data2, "items")
-                    or _find_key_recursive(data2, "elements")
-                    or []
-                )
-                items = [_extract_item(x) for x in raw_items if _extract_item(x)]
+                items = _collect_items_recursive(data2)
                 if items:
                     print(f"[scraper] /search/section -> {len(items)} anuncios encontrados.")
                     return items
@@ -241,6 +259,7 @@ def search_term(term: str) -> list[dict]:
     print(f"[scraper] Activando fallback web para '{term}'...")
     web_items = _search_web(term)
     return web_items
+
 
 
 
