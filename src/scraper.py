@@ -94,7 +94,7 @@ def _find_key_recursive(d, target="search_id"):
 
 
 def search_term(term: str) -> list[dict]:
-    """Busca anuncios para un término usando la API moderna v3 en 2 pasos de Wallapop."""
+    """Busca anuncios para un término usando la API v3 de Wallapop."""
     headers = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
         "Accept": "application/json, text/plain, */*",
@@ -105,7 +105,6 @@ def search_term(term: str) -> list[dict]:
     }
 
     params = {
-        "source": "search_box",
         "keywords": term,
         "min_sale_price": config.CONFIG["price_min"],
         "max_sale_price": config.CONFIG["price_max"],
@@ -113,7 +112,6 @@ def search_term(term: str) -> list[dict]:
     }
 
     loc_name = config.CONFIG.get("location", "").strip().lower()
-    lat = lon = None
     if loc_name in CITY_COORDINATES:
         lat, lon = CITY_COORDINATES[loc_name]
         params["latitude"] = lat
@@ -123,49 +121,16 @@ def search_term(term: str) -> list[dict]:
 
     session = requests.Session(impersonate="chrome") if HAS_CURL_CFFI else requests.Session()
 
-    # Paso 1: Obtener el search_id inicial
-    init_urls = [
-        "https://api.wallapop.com/api/v3/search/components",
-        "https://api.wallapop.com/api/v3/search",
-    ]
-
-    search_id = None
-    for init_url in init_urls:
-        try:
-            r = session.get(init_url, headers=headers, params=params, timeout=10)
-            if r.status_code == 200:
-                data = r.json()
-                search_id = _find_key_recursive(data, "search_id")
-                if search_id:
-                    print(f"[scraper] Obtenido search_id con éxito: {search_id}")
-                    break
-                else:
-                    keys = list(data.keys()) if isinstance(data, dict) else type(data)
-                    print(f"[scraper] {init_url} respondió 200 pero no contenía search_id. Claves: {keys}")
-            else:
-                snippet = r.text[:100].replace("\n", " ") if r.text else ""
-                print(f"[scraper] {init_url} -> Código {r.status_code}: {snippet}")
-        except Exception as e:
-            print(f"[scraper] Error en {init_url}: {e}")
-
-    if not search_id:
-        print(f"[scraper] No se obtuvo search_id para '{term}'")
-        return []
-
-    # Paso 2: Obtener los anuncios usando el search_id y step=0
-    section_url = "https://api.wallapop.com/api/v3/search/section"
-    section_params = {
-        "search_id": search_id,
-        "step": 0,
-    }
-
+    # VÍA 1: Endpoint directo /api/v3/search (devuelve los productos en una sola llamada)
+    direct_url = "https://api.wallapop.com/api/v3/search"
     try:
-        r = session.get(section_url, headers=headers, params=section_params, timeout=10)
+        r = session.get(direct_url, headers=headers, params=params, timeout=10)
         if r.status_code == 200:
             data = r.json()
             raw_items = (
-                data.get("section", {}).get("payload", {}).get("items", [])
-                or data.get("items", [])
+                data.get("data", {}).get("section", {}).get("payload", {}).get("items", [])
+                or data.get("section", {}).get("payload", {}).get("items", [])
+                or data.get("search_objects", [])
                 or _find_key_recursive(data, "items")
                 or []
             )
@@ -174,14 +139,67 @@ def search_term(term: str) -> list[dict]:
                 parsed = _extract_item(raw)
                 if parsed:
                     items.append(parsed)
-            return items
+            if items:
+                print(f"[scraper] /api/v3/search directo -> {len(items)} anuncios encontrados con éxito.")
+                return items
+            else:
+                keys = list(data.keys()) if isinstance(data, dict) else type(data)
+                print(f"[scraper] /api/v3/search devolvió 200. Claves disponibles: {keys}")
         else:
-            snippet = r.text[:120].replace("\n", " ") if r.text else ""
-            print(f"[scraper] /api/v3/search/section -> Código {r.status_code}: {snippet}")
-            return []
+            print(f"[scraper] /api/v3/search -> Código {r.status_code}")
     except Exception as e:
-        print(f"[scraper] Error en /search/section: {e}")
-        return []
+        print(f"[scraper] Error en /api/v3/search directo: {e}")
+
+    # VÍA 2: Endpoint /api/v3/search/components
+    components_url = "https://api.wallapop.com/api/v3/search/components"
+    try:
+        r = session.get(components_url, headers=headers, params=params, timeout=10)
+        if r.status_code == 200:
+            data = r.json()
+            # Comprobar si components ya traía items
+            raw_items = (
+                data.get("section", {}).get("payload", {}).get("items", [])
+                or data.get("search_objects", [])
+                or _find_key_recursive(data, "items")
+                or []
+            )
+            if raw_items:
+                items = []
+                for raw in raw_items:
+                    parsed = _extract_item(raw)
+                    if parsed:
+                        items.append(parsed)
+                if items:
+                    print(f"[scraper] /search/components -> {len(items)} anuncios encontrados.")
+                    return items
+
+            # Si no hay items directos, extraer search_id
+            search_id = _find_key_recursive(data, "search_id")
+            if search_id:
+                section_url = f"https://api.wallapop.com/api/v3/search/section?search_id={search_id}&step=0"
+                r2 = session.get(section_url, headers=headers, timeout=10)
+                if r2.status_code == 200:
+                    sec_data = r2.json()
+                    sec_items = (
+                        sec_data.get("section", {}).get("payload", {}).get("items", [])
+                        or _find_key_recursive(sec_data, "items")
+                        or []
+                    )
+                    items = []
+                    for raw in sec_items:
+                        parsed = _extract_item(raw)
+                        if parsed:
+                            items.append(parsed)
+                    if items:
+                        return items
+                else:
+                    snippet = r2.text[:100].replace("\n", " ") if r2.text else ""
+                    print(f"[scraper] {section_url} -> {r2.status_code}: {snippet}")
+    except Exception as e:
+        print(f"[scraper] Error en vía components: {e}")
+
+    return []
+
 
 
 
