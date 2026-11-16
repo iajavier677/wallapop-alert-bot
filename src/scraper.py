@@ -27,6 +27,10 @@ def _extract_item(item: dict) -> dict | None:
     if not isinstance(item, dict):
         return None
 
+    # Ignorar anuncios ya reservados o vendidos
+    if item.get("reserved") or item.get("flags", {}).get("reserved"):
+        return None
+
     # Si viene anidado en 'item'
     if "item" in item and isinstance(item["item"], dict):
         item = item["item"]
@@ -36,10 +40,10 @@ def _extract_item(item: dict) -> dict | None:
     if not title:
         return None
 
-    # Precio (puede ser float, int o dict con {"amount": X, "currency": "EUR"})
+    # Precio (soporta int, float, price.amount y price.cash.amount)
     raw_price = item.get("price", 0)
     if isinstance(raw_price, dict):
-        raw_price = raw_price.get("amount", 0)
+        raw_price = raw_price.get("amount") or raw_price.get("cash", {}).get("amount", 0)
     try:
         price = int(float(raw_price))
     except (ValueError, TypeError):
@@ -69,6 +73,7 @@ def _extract_item(item: dict) -> dict | None:
         "location": city,
         "url": url,
     }
+
 
 
 def _find_key_recursive(d, target="search_id"):
@@ -147,21 +152,17 @@ def search_term(term: str) -> list[dict]:
         print(f"[scraper] No se obtuvo search_id para '{term}'")
         return []
 
-    # Paso 2: Obtener los anuncios usando el search_id
+    # Paso 2: Obtener los anuncios usando el search_id y step=0
     section_url = "https://api.wallapop.com/api/v3/search/section"
     section_params = {
         "search_id": search_id,
-        "start": 0,
+        "step": 0,
     }
-    if lat and lon:
-        section_params["latitude"] = lat
-        section_params["longitude"] = lon
 
     try:
         r = session.get(section_url, headers=headers, params=section_params, timeout=10)
         if r.status_code == 200:
             data = r.json()
-            # Buscar la lista de items
             raw_items = (
                 data.get("section", {}).get("payload", {}).get("items", [])
                 or data.get("items", [])
@@ -175,12 +176,13 @@ def search_term(term: str) -> list[dict]:
                     items.append(parsed)
             return items
         else:
-            snippet = r.text[:100].replace("\n", " ") if r.text else ""
+            snippet = r.text[:120].replace("\n", " ") if r.text else ""
             print(f"[scraper] /api/v3/search/section -> Código {r.status_code}: {snippet}")
             return []
     except Exception as e:
         print(f"[scraper] Error en /search/section: {e}")
         return []
+
 
 
 
